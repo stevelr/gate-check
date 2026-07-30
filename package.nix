@@ -133,6 +133,7 @@ let
     pkgs.coreutils
     pkgs.diffutils
     pkgs.dprint
+    pkgs.fd
     pkgs.findutils
     pkgs.git
     pkgs.gnugrep
@@ -166,9 +167,17 @@ let
       strongKind = "asterisks";
       lineWidth = default_line_length;
     };
+    # markup_fmt handles html/htm (and vue/svelte/xml). Its width key is
+    # printWidth; `lineWidth` is rejected by the plugin.
+    markup = {
+      printWidth = default_line_length;
+    };
+    # The ruff plugin's width key is lineLength, NOT lineWidth: an unknown
+    # property fails plugin init outright ("Error initializing from
+    # configuration file"), silently disabling it.
     ruff = {
       quoteStyle = "double";
-      lineWidth = default_line_length;
+      lineLength = default_line_length;
     };
     toml = {
       lineWidth = default_line_length;
@@ -269,6 +278,14 @@ let
         "*.yaml"
         "*.yml"
         "*.kdl"
+        # html/htm go to dprint's g-plane-markup_fmt, NOT biome: biome 2.x's
+        # html formatter is not idempotent (it rewraps prose, then the new line
+        # lengths push inline <code> spans onto their own lines on the next
+        # pass), so a formatted tree never reaches a fixed point and `check`
+        # reports files `fmt` has already written. markup_fmt converges in one
+        # pass and leaves <pre> content byte-identical.
+        "*.html"
+        "*.htm"
       ];
     };
 
@@ -281,8 +298,6 @@ let
       ];
       includes = [
         "*.css"
-        "*.html"
-        "*.htm"
         "*.graphql"
         "*.gql"
         "*.js"
@@ -360,7 +375,9 @@ let
     json.formatter.indentStyle = "space";
     css.formatter.enabled = true;
     css.formatter.indentStyle = "tab";
-    html.formatter.enabled = true;
+    # Off deliberately: html/htm are routed to dprint's markup_fmt because
+    # biome's html formatter is not idempotent (see the dprint includes above).
+    html.formatter.enabled = false;
     assist.enabled = true;
     assist.actions.source.organizeImports = "on";
   };
@@ -523,8 +540,26 @@ let
       note "compiled config -> $cachedir (from ''${cfgdir:-built-in defaults})"
     }
 
-    treefmt_run() {   # <extra flags and paths...>
-      "$TREEFMT_BIN" --config-file "$EFFECTIVE_TREEFMT" --allow-missing-formatter "$@"
+    # ---- shared treefmt invocation ---------------------------------------------
+    # fmt and check both hand treefmt an EXPLICIT file list (from candidates())
+    # instead of letting it walk. treefmt's walker defaults to `auto`, which picks
+    # the git/jujutsu walker in a repo but the filesystem walker in check's
+    # non-git mirror — two different file sets for what is meant to be the same
+    # question. Explicit paths bypass the walker in both cases while config
+    # `excludes` still apply, so fmt and check agree by construction.
+    #
+    # --no-cache in BOTH for the same reason: treefmt's eval cache keys on
+    # size+mtime and is stamped right after a format, so any formatter that is not
+    # idempotent leaves fmt reporting "0 files changed" on files check still
+    # flags, with no way to converge. check was already --no-cache; fmt was not.
+    #
+    # The list is piped through xargs so a tree larger than ARG_MAX still works.
+    treefmt_run() {   # <listfile> <root> [extra flags...]
+      local list="$1" root="$2"; shift 2
+      [ -s "$list" ] || return 0
+      xargs -a "$list" -d '\n' -r \
+        "$TREEFMT_BIN" --config-file "$EFFECTIVE_TREEFMT" --allow-missing-formatter \
+                       --tree-root "$root" -C "$root" --no-cache "$@" --
     }
 
     # ---- gen -------------------------------------------------------------------
@@ -559,9 +594,9 @@ let
       [ -n "$base" ] || die "pipe: empty buffer name"
       local -a fmt=()
       case "$base" in
-        *.json|*.jsonc|*.json5|*.md|*.markdown|*.toml|*.yaml|*.yml|*.kdl)
+        *.json|*.jsonc|*.json5|*.md|*.markdown|*.toml|*.yaml|*.yml|*.kdl|*.html|*.htm)
           fmt=(dprint fmt --config "$EFFECTIVE_DPRINT" --config-discovery=ignore-descendants --stdin "$base") ;;
-        *.css|*.html|*.htm|*.graphql|*.gql|*.js|*.mjs|*.cjs|*.jsx|*.ts|*.mts|*.cts|*.tsx|*.vue)
+        *.css|*.graphql|*.gql|*.js|*.mjs|*.cjs|*.jsx|*.ts|*.mts|*.cts|*.tsx|*.vue)
           fmt=(biome format "--config-path=$EFFECTIVE_BIOME" "--stdin-file-path=$base") ;;
         *.rs)       fmt=(rustfmt --edition 2024) ;;
         *.nix)      fmt=(nixfmt) ;;
@@ -573,52 +608,72 @@ let
     }
 
     # ---- candidate enumeration -------------------------------------------------
-    candidates() {
-      if [ "$#" -gt 0 ]; then
-        local p
-        for p in "$@"; do
-          if   [ -d "$p" ]; then find "$p" -type f
-          elif [ -e "$p" ]; then printf '%s\n' "$p"
-          fi
-        done
-      elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git ls-files
-      else
-        find . -type f
+    # ONE enumerator, shared by fmt, check and lint, so all three agree on the
+    # file set. fd replaces the old `git ls-files` / `find` split because it:
+    #   - honours .gitignore/.ignore/.fdignore with no git dependency, so it
+    #     behaves identically in a repo and in check's mirror,
+    #   - includes dotfiles (--hidden) the way `git ls-files -co` did,
+    #   - emits regular files only (--type f), so a symlink is never followed by
+    #     fmt or by check. treefmt's git walker used to hand symlinks to fmt while
+    #     check skipped them explicitly.
+    # Paths are relative to the search root, matching treefmt's -C.
+    #
+    # Difference from the old `git ls-files -co --exclude-standard`: a file that is
+    # BOTH tracked and gitignored was listed by git and is skipped by fd. Ignored
+    # now means ignored, whatever its index state.
+    FD_ARGS=(--type f --hidden --no-require-git --exclude .git --exclude .jj)
+    candidates() {   # [paths...]
+      if [ "$#" -eq 0 ]; then
+        fd "''${FD_ARGS[@]}" .
+        return
       fi
+      local p
+      for p in "$@"; do
+        if   [ -L "$p" ]; then continue                      # never follow symlinks
+        elif [ -d "$p" ]; then fd "''${FD_ARGS[@]}" . "$p"
+        elif [ -f "$p" ]; then printf '%s\n' "$p"
+        fi
+      done
+    }
+
+    # ---- in-place formatting ---------------------------------------------------
+    # Named fmt_tree, not fmt: pipe() already uses a local array named `fmt`.
+    fmt_tree() {   # [paths...]
+      local work list
+      work="$(mk_tmpd)"; list="$work/files"
+      candidates "$@" > "$list"
+      treefmt_run "$list" "$PWD"
     }
 
     # ---- read-only formatting check --------------------------------------------
     # treefmt has no dry-run, so mirror candidates into a temp tree, format the
-    # mirror, and compare. Work tree is unmodified. Enumeration is
-    # gitignore-aware to match treefmt's discovery.
+    # mirror, and compare. Work tree is unmodified. The mirror is populated from
+    # the SAME candidates() list fmt uses, and treefmt is given that list
+    # explicitly, so check can only disagree with fmt about a file's contents,
+    # never about whether the file is in scope.
     check_fmt() {   # [paths...]
-      local rc=0 f tmpd
-      local -a cand changed
-      if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        mapfile -t cand < <(git ls-files -co --exclude-standard -- "$@")
-      else
-        mapfile -t cand < <(candidates "$@")
-      fi
-      [ "''${#cand[@]}" -gt 0 ] || return 0
-      tmpd="$(mk_tmpd)"
-      for f in "''${cand[@]}"; do
-        [ -f "$f" ] && [ ! -L "$f" ] || continue
-        case $f in */*) mkdir -p "$tmpd/''${f%/*}" ;; esac
-        cp -p -- "$f" "$tmpd/$f"
-      done
+      local rc=0 f work list mirror
+      local -a changed
+      work="$(mk_tmpd)"; list="$work/files"
+      candidates "$@" > "$list"
+      [ -s "$list" ] || return 0
+      mirror="$(mk_tmpd)"
+      while IFS= read -r f; do
+        case $f in */*) mkdir -p "$mirror/''${f%/*}" ;; esac
+        cp -p -- "$f" "$mirror/$f"
+      done < "$list"
       # Formatter configs the mirror needs because their tools discover them
       # relative to the tree being formatted. dprint/biome/ruff get configs
       # via --config with absolute path outside the mirror.
       for f in rustfmt.toml .rustfmt.toml .editorconfig; do
-        if [ -f "$f" ] && [ ! -e "$tmpd/$f" ]; then cp -p -- "$f" "$tmpd/$f"; fi
+        if [ -f "$f" ] && [ ! -e "$mirror/$f" ]; then cp -p -- "$f" "$mirror/$f"; fi
       done
-      treefmt_run --tree-root "$tmpd" -C "$tmpd" --no-cache >&2 || rc=1
+      treefmt_run "$list" "$mirror" >&2 || rc=1
       changed=()
-      for f in "''${cand[@]}"; do
-        [ -f "$tmpd/$f" ] || continue
-        cmp -s -- "$f" "$tmpd/$f" || changed+=("$f")
-      done
+      while IFS= read -r f; do
+        [ -f "$mirror/$f" ] || continue
+        cmp -s -- "$f" "$mirror/$f" || changed+=("$f")
+      done < "$list"
       if [ "''${#changed[@]}" -gt 0 ]; then
         note "needs formatting (''${#changed[@]}):"
         printf '  %s\n' "''${changed[@]}" >&2
@@ -694,7 +749,7 @@ let
     case "$cmd" in
       fmt|format)
         parse_opts "$@"; compile_config
-        treefmt_run "''${POS[@]}"
+        fmt_tree "''${POS[@]}"
         ;;
       pipe)
         parse_opts "$@"; compile_config
