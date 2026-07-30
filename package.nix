@@ -3,7 +3,7 @@
 
 let
   package_name = "gate-check";
-  default_line_length = 110;
+  default_line_length = 95;
 
   jsonFormat = pkgs.formats.json { };
   tomlFormat = pkgs.formats.toml { };
