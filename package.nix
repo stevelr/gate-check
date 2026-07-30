@@ -1,43 +1,9 @@
 # gate-check.nix package builder for gate: ci formatter and linter
-#
-#   gate fmt    [-d DIR] [paths...]   format in place (default: whole repo)
-#   gate check  [-d DIR] [paths...]   check formatting + lint (read-only)
-#   gate lint   [-d DIR] [paths...]   linters only
-#   gate format ...                   alias for fmt
-#   gate pipe   [-d DIR] <name>       stdin -> stdout; <name> picks formatter
-#   gate gen    [-f] [-d DIR]         write portable default configs to ./.gate
-#
-# At run time (fmt | check | pipe) gate compiles the resolved config into an
-# "effective" config under a per-(config,gate-version) CACHE dir, so repeated
-# invocations reuse it instead of regenerating.
-#
-# CONFIG RESOLUTION (check | fmt | lint | pipe): the effective dprint.json,
-# treefmt.toml, biome.json and ruff.toml are each resolved independently,
-# in order:
-#   1. -d/--dir DIR         (must exist, else error)
-#   2. $GATE_CONFIG         (must exist, else error)
-#   3. nearest ./.gate walking up from $PWD
-#   4. $XDG_CONFIG_HOME/gate
-#   5. the built-in defaults baked into this gate
-#
-# A file absent from the chosen dir falls back to the built-in default.
-#
-# Performance:
-# The resolved config is COMPILED once (plugin tokens + config paths expanded)
-# into a per-(config,gate)-version cache dir and reused across runs.
-# `pipe` bypasses treefmt entirely, dispatching to each formatter's stdin mode.
-{
-  pkgs,
-  version,
-  ...
-}:
+{ pkgs, version, ... }:
 
 let
-  shellcheck_bin = "${pkgs.shellcheck}/bin/shellcheck";
+  package_name = "gate-check";
   default_line_length = 110;
-  typos_bin = "${pkgs.typos}/bin/typos";
-  ruff_bin = "${pkgs.ruff}/bin/ruff";
-  sed_bin = "${pkgs.gnused}/bin/sed";
 
   jsonFormat = pkgs.formats.json { };
   tomlFormat = pkgs.formats.toml { };
@@ -46,6 +12,11 @@ let
   raw_treefmt_toml = tomlFormat.generate "treefmt.toml" treefmt_toml_src;
   raw_biome_json = jsonFormat.generate "biome.json" biome_json_src;
   raw_ruff_toml = tomlFormat.generate "ruff.toml" ruff_toml_src;
+
+  shellcheck_bin = "${pkgs.shellcheck}/bin/shellcheck";
+  typos_bin = "${pkgs.typos}/bin/typos";
+  ruff_bin = "${pkgs.ruff}/bin/ruff";
+  sed_bin = "${pkgs.gnused}/bin/sed";
 
   # BUILD-TIME ONLY: the dprint config with its plugin tokens already expanded.
   # Never written to a repo. It's needed so the templates below
@@ -140,7 +111,8 @@ let
   # templates change (nixpkgs bump), invalidating stale compiled caches.
   cfgVersion = builtins.substring 0 16 (
     builtins.hashString "sha256" (
-      pluginSedExpr
+      "${version}"
+      + pluginSedExpr
       + "|"
       + "${treefmt_toml}"
       + "|"
@@ -354,7 +326,7 @@ let
   };
 
   # ruff settings for `ruff format` AND `ruff check`. Passed by absolute path via
-  # --config, which also disables ruff's own upward config discovery
+  # --config, which disables ruff's internal config discovery
   # (including pyproject.toml settings).
   # This is needed to make config discovery independent of the process cwd,
   # so editor (e.g. helix) format-on-save uses formatting consistent
@@ -394,7 +366,7 @@ let
     set -uo pipefail
     export PATH="${gatePath}:$PATH"
 
-    # gate-check.nix package builder for gate: ci formatter and linter
+    # gate - ci formatter and linter
     #
     #   gate fmt    [-d DIR] [paths...]   format in place (default: whole repo)
     #   gate check  [-d DIR] [paths...]   check formatting + lint (read-only)
@@ -407,21 +379,20 @@ let
     # "effective" config under a per-(config,gate-version) CACHE dir, so repeated
     # invocations reuse it instead of regenerating.
     #
-    # CONFIG RESOLUTION (check | fmt | lint | pipe): the effective dprint.json,
-    # treefmt.toml, biome.json and ruff.toml are each resolved independently,
-    # in order:
-    #   1. -d/--dir DIR         (must exist, else error)
-    #   2. $GATE_CONFIG         (must exist, else error)
-    #   3. nearest ./.gate walking up from $PWD
-    #   4. $XDG_CONFIG_HOME/gate
-    #   5. the built-in defaults baked into this gate
-    # 
+    # Config resolution (check | fmt | lint | pipe):
+    #   The effective dprint.json, treefmt.toml, biome.json and ruff.toml are each
+    #   resolved independently, in this order:
+    #    1. -d/--dir DIR         (must exist, else error)
+    #    2. $GATE_CONFIG         (must exist, else error)
+    #    3. nearest ./.gate walking up from $PWD
+    #    4. $XDG_CONFIG_HOME/gate
+    #    5. the built-in defaults baked into this gate
     # A file absent from the chosen dir falls back to the built-in default.
     # 
     # Performance:
-    # The resolved config is COMPILED once (plugin tokens + config paths expanded)
-    # into a per-(config,gate)-version cache dir and reused across runs.
-    # `pipe` bypasses treefmt entirely, dispatching to each formatter's stdin mode.
+    #   The resolved config is COMPILED once (plugin tokens + config paths expanded)
+    #   into a per-(config,gate)-version cache dir and reused across runs.
+    #   `pipe` bypasses treefmt entirely, dispatching to each formatter's stdin mode.
 
     BUILTIN_DPRINT="${dprint_json}"
     BUILTIN_TREEFMT="${treefmt_toml}"
@@ -740,11 +711,14 @@ let
         parse_opts "$@"
         gen
         ;;
-      ""|-h|--help|help)
+      version|-V|--version)
+        echo "${package_name}-v${version}"
+        ;;
+      help|-h|--help|"")
         usage
         ;;
       *)
-        die "unknown command '$cmd' (expected: fmt | check | lint | pipe | gen)"
+        die "unknown command '$cmd' (expected: fmt | check | lint | pipe | gen | version)"
         ;;
     esac
   '';
@@ -762,7 +736,7 @@ let
   ];
 in
 pkgs.symlinkJoin {
-  name = "gate-check";
+  name = package_name;
   inherit version;
   paths = [ gateScript ] ++ toolPackages;
   meta = {
