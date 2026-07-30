@@ -342,9 +342,13 @@ let
   biome_json_src = {
     "$schema" = "https://biomejs.dev/schemas/2.4.15/schema.json";
     plugins = [ ];
-    vcs.enabled = true;
-    vcs.clientKind = "git";
-    vcs.useIgnoreFile = true;
+    # No VCS integration: biome resolves its VCS root to the folder holding this
+    # config (./.gate, or the nix store path for the built-in), and with
+    # useIgnoreFile it hard-errors there with "couldn't find an ignore file".
+    # gate does its own gitignore-aware enumeration (git ls-files -co
+    # --exclude-standard) and hands treefmt explicit paths in a non-git mirror
+    # tree, so biome has nothing to discover anyway.
+    vcs.enabled = false;
     files.ignoreUnknown = false;
     files.maxSize = 1024 * 1024 * 5; # 5 MiB
     formatter.enabled = true;
