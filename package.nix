@@ -408,7 +408,17 @@ let
     #    4. $XDG_CONFIG_HOME/gate
     #    5. the built-in defaults baked into this gate
     # A file absent from the chosen dir falls back to the built-in default.
-    # 
+    #
+    # Status (fmt | check | lint):
+    #   Each run ends with exactly one status line on stderr, and it is the only
+    #   verdict worth reading:
+    #     gate: check ok                                   (green, exit 0)
+    #     gate: check FAILED: formatting (3 files), typos  (red,   exit 1)
+    #   Green is printed only when EVERY step passed. Per-tool success chatter is
+    #   suppressed where the tool allows it so no sub-command can flash green while
+    #   another is failing. Colour is disabled when stderr is not a tty or when
+    #   $NO_COLOR is set.
+    #
     # Performance:
     #   The resolved config is COMPILED once (plugin tokens + config paths expanded)
     #   into a per-(config,gate)-version cache dir and reused across runs.
@@ -421,9 +431,45 @@ let
     TREEFMT_BIN="${pkgs.treefmt}/bin/treefmt"
     CFG_VERSION="${cfgVersion}"
 
-    die()  { printf 'gate: %s\n' "$*" >&2; exit 2; }
+    # ---- status reporting ------------------------------------------------------
+    # Every sub-tool reports success differently: ruff prints a green
+    # "All checks passed!", treefmt prints a summary line, shellcheck/xmllint/typos
+    # print nothing. Left alone one tool's green success outranks another tool's
+    # plain-text failure list, so a run with formatting errors still LOOKS green.
+    # gate therefore silences per-tool success chatter where the tool allows it
+    # (ruff -q, treefmt --quiet in check) and always ends with exactly ONE status
+    # line: red when any step failed, green only when every step passed.
+    if [ -t 2 ] && [ -z "''${NO_COLOR:-}" ]; then
+      C_RED=$'\033[1;31m'; C_GREEN=$'\033[1;32m'; C_OFF=$'\033[0m'
+    else
+      C_RED=""; C_GREEN=""; C_OFF=""
+    fi
+
+    die()  { printf '%sgate: %s%s\n' "$C_RED" "$*" "$C_OFF" >&2; exit 2; }
     note() { printf 'gate: %s\n' "$*" >&2; }
+    warn() { printf '%sgate: %s%s\n' "$C_RED" "$*" "$C_OFF" >&2; }
     have() { command -v "$1" >/dev/null 2>&1; }
+
+    # Steps that failed this run, named for the final status line.
+    GATE_FAILED=()
+    fail() { GATE_FAILED+=("$1"); }
+
+    plural() {   # <count> <noun> -> "1 file" | "3 files"
+      if [ "$1" -eq 1 ]; then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi
+    }
+
+    # Single exit point for fmt | check | lint. Never prints green unless
+    # GATE_FAILED is empty, so a green line always means the whole run is clean.
+    finish() {   # <command label>
+      local joined
+      if [ "''${#GATE_FAILED[@]}" -eq 0 ]; then
+        printf '%sgate: %s ok%s\n' "$C_GREEN" "$1" "$C_OFF" >&2
+        exit 0
+      fi
+      joined="$(printf '%s, ' "''${GATE_FAILED[@]}")"
+      printf '%sgate: %s FAILED: %s%s\n' "$C_RED" "$1" "''${joined%, }" "$C_OFF" >&2
+      exit 1
+    }
 
     # Print the contiguous leading help comment, stripping '# '.
     usage() {
@@ -667,15 +713,20 @@ let
       for f in rustfmt.toml .rustfmt.toml .editorconfig; do
         if [ -f "$f" ] && [ ! -e "$mirror/$f" ]; then cp -p -- "$f" "$mirror/$f"; fi
       done
-      treefmt_run "$list" "$mirror" >&2 || rc=1
+      # --quiet here, not in fmt: treefmt's own summary reads "formatted 402 files
+      # (34 changed)", which is actively wrong for a read-only check (it formatted
+      # the MIRROR). gate prints the authoritative list below. --quiet still lets
+      # real formatter errors through.
+      treefmt_run "$list" "$mirror" --quiet >&2 || { rc=1; fail "formatter error"; }
       changed=()
       while IFS= read -r f; do
         [ -f "$mirror/$f" ] || continue
         cmp -s -- "$f" "$mirror/$f" || changed+=("$f")
       done < "$list"
       if [ "''${#changed[@]}" -gt 0 ]; then
-        note "needs formatting (''${#changed[@]}):"
+        warn "needs formatting (''${#changed[@]}):"
         printf '  %s\n' "''${changed[@]}" >&2
+        fail "formatting ($(plural "''${#changed[@]}" file))"
         rc=1
       fi
       return "$rc"
@@ -715,26 +766,30 @@ let
 
       if [ "''${#sh_files[@]}" -gt 0 ]; then
         note "shellcheck (''${#sh_files[@]})"
-        "${shellcheck_bin}" "''${sh_files[@]}" || rc=1
+        "${shellcheck_bin}" "''${sh_files[@]}" || { rc=1; fail shellcheck; }
       fi
 
       if [ "''${#py_files[@]}" -gt 0 ] && have ruff; then
         note "ruff check (''${#py_files[@]})"
-        "${ruff_bin}" check --config "$EFFECTIVE_RUFF" "''${py_files[@]}" || rc=1
+        # -q prints diagnostics but suppresses ruff's own green "All checks
+        # passed!", which otherwise reads as an overall pass next to another
+        # step's failures. gate's final status line is the verdict.
+        "${ruff_bin}" check -q --config "$EFFECTIVE_RUFF" "''${py_files[@]}" || { rc=1; fail "ruff check"; }
       fi
 
       if [ "''${#xml_files[@]}" -gt 0 ] && have xmllint; then
         note "xmllint (''${#xml_files[@]})"
-        "${pkgs.libxml2}/bin/xmllint" --noout "''${xml_files[@]}" || rc=1
+        "${pkgs.libxml2}/bin/xmllint" --noout "''${xml_files[@]}" || { rc=1; fail xmllint; }
       fi
 
       note "typos"
-      if [ "$#" -gt 0 ]; then ${typos_bin} "$@" || rc=1; else ${typos_bin} || rc=1; fi
+      if [ "$#" -gt 0 ]; then ${typos_bin} "$@" || { rc=1; fail typos; }
+      else ${typos_bin} || { rc=1; fail typos; }; fi
 
       if [ "''${#rs_files[@]}" -gt 0 ] || { [ "$#" -eq 0 ] && [ -f Cargo.toml ]; }; then
         if have cargo; then
           note "cargo clippy"
-          cargo clippy --all-targets -- -D warnings || rc=1
+          cargo clippy --all-targets -- -D warnings || { rc=1; fail clippy; }
         else
           note "clippy skipped (no cargo on PATH)"
         fi
@@ -748,22 +803,25 @@ let
     case "$cmd" in
       fmt|format)
         parse_opts "$@"; compile_config
-        fmt_tree "''${POS[@]}"
+        fmt_tree "''${POS[@]}" || fail "formatter error"
+        finish fmt
         ;;
       pipe)
         parse_opts "$@"; compile_config
+        # No status line: stdout replaces an editor buffer, and a per-keystroke
+        # "ok" on stderr is noise in that contract.
         pipe "''${POS[@]}"
         ;;
       check)
         parse_opts "$@"; compile_config
-        rc=0
-        check_fmt "''${POS[@]}" || rc=1
-        lint "''${POS[@]}" || rc=1
-        exit "$rc"
+        check_fmt "''${POS[@]}" || true
+        lint "''${POS[@]}" || true
+        finish check
         ;;
       lint)
         parse_opts "$@"; compile_config   # lint needs EFFECTIVE_RUFF for `ruff check`
-        lint "''${POS[@]}"
+        lint "''${POS[@]}" || true
+        finish lint
         ;;
       gen)
         parse_opts "$@"
