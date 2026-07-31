@@ -126,7 +126,7 @@ let
 
   # Tools gate puts on its OWN PATH before invoking treefmt / stdin formatters,
   # so the bare command names in treefmt.toml resolve to gate's pinned versions
-  # regardless of the caller's PATH. Includes the coreutils/git plumbing the
+  # regardless of the caller's PATH. Includes the coreutils/fd plumbing the
   # script's bare calls need.
   gatePath = pkgs.lib.makeBinPath [
     pkgs.biome
@@ -135,7 +135,6 @@ let
     pkgs.dprint
     pkgs.fd
     pkgs.findutils
-    pkgs.git
     pkgs.gnugrep
     pkgs.gnused
     pkgs.just
@@ -360,9 +359,9 @@ let
     # No VCS integration: biome resolves its VCS root to the folder holding this
     # config (./.gate, or the nix store path for the built-in), and with
     # useIgnoreFile it hard-errors there with "couldn't find an ignore file".
-    # gate does its own gitignore-aware enumeration (git ls-files -co
-    # --exclude-standard) and hands treefmt explicit paths in a non-git mirror
-    # tree, so biome has nothing to discover anyway.
+    # gate does its own gitignore-aware enumeration (fd, see candidates()) and
+    # hands treefmt explicit paths in a non-git mirror tree, so biome has nothing
+    # to discover anyway.
     vcs.enabled = false;
     files.ignoreUnknown = false;
     files.maxSize = 1024 * 1024 * 5; # 5 MiB
