@@ -852,7 +852,7 @@ let
   ];
 in
 pkgs.symlinkJoin {
-  name = package_name;
+  pname = package_name;
   inherit version;
   paths = [ gateScript ] ++ toolPackages;
   meta = {
