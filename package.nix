@@ -733,13 +733,26 @@ let
     }
 
     # Classify an extensionless file by shebang: prints "sh" | "py" | "".
+    # A nix-shell shebang names nix-shell, not the real interpreter -- that
+    # lives on a following '#! nix-shell -i INTERP' line -- so look there.
     shebang_class() {
-      local first
+      local first interp line n=0
       IFS= read -rn 256 first < "$1" 2>/dev/null
       [[ $first == '#!'* ]] || return 0
       LC_ALL=C grep -qIe '^#!' -- "$1" 2>/dev/null || return 0   # skip binaries
-      if   [[ $first =~ (^|/|[[:space:]])(bash|sh|dash)([[:space:]]|$) ]]; then echo sh
-      elif [[ $first =~ (^|/|[[:space:]])python[0-9.]*([[:space:]]|$) ]]; then echo py
+      interp=$first
+      if [[ $first =~ (^|/|[[:space:]])nix-shell([[:space:]]|$) ]]; then
+        interp=""
+        while IFS= read -r line && [ "$((n += 1))" -le 20 ]; do
+          [[ $line == '#!'*nix-shell* ]] || continue
+          if [[ $line =~ [[:space:]]-i[[:space:]]+([^[:space:]]+) ]]; then
+            interp=''${BASH_REMATCH[1]}
+            break
+          fi
+        done < "$1"
+      fi
+      if   [[ $interp =~ (^|/|[[:space:]])(bash|sh|dash)([[:space:]]|$) ]]; then echo sh
+      elif [[ $interp =~ (^|/|[[:space:]])python[0-9.]*([[:space:]]|$) ]]; then echo py
       fi
     }
 
