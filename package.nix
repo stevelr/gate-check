@@ -802,7 +802,7 @@ let
       if [ "''${#rs_files[@]}" -gt 0 ] || { [ "$#" -eq 0 ] && [ -f Cargo.toml ]; }; then
         if have cargo; then
           note "cargo clippy"
-          cargo clippy --all-targets -- -D warnings || { rc=1; fail clippy; }
+          cargo clippy --all-targets --all-features -- -D warnings || { rc=1; fail clippy; }
         else
           note "clippy skipped (no cargo on PATH)"
         fi
