@@ -12,11 +12,14 @@ let
   raw_treefmt_toml = tomlFormat.generate "treefmt.toml" treefmt_toml_src;
   raw_biome_json = jsonFormat.generate "biome.json" biome_json_src;
   raw_ruff_toml = tomlFormat.generate "ruff.toml" ruff_toml_src;
+  raw_clippy_toml = tomlFormat.generate "clippy.toml" clippy_toml_src;
 
   shellcheck_bin = "${pkgs.shellcheck}/bin/shellcheck";
   typos_bin = "${pkgs.typos}/bin/typos";
   ruff_bin = "${pkgs.ruff}/bin/ruff";
   sed_bin = "${pkgs.gnused}/bin/sed";
+  yq_bin = "${pkgs.yq-go}/bin/yq";
+  jq_bin = "${pkgs.jq}/bin/jq";
 
   # BUILD-TIME ONLY: the dprint config with its plugin tokens already expanded.
   # Never written to a repo. It's needed so the templates below
@@ -39,17 +42,19 @@ let
     cp ${raw_treefmt_toml} $out/treefmt.toml
     cp ${raw_biome_json}   $out/biome.json
     cp ${raw_ruff_toml}    $out/ruff.toml
+    cp ${raw_clippy_toml}  $out/clippy.toml
     chmod +w $out/*
     export DPRINT_CACHE_DIR="$TMPDIR/dprint-cache"
     cd $out
     dprint fmt --config ${buildTimeDprintConfig} --config-discovery=false \
-      dprint.json treefmt.toml biome.json ruff.toml
+      dprint.json treefmt.toml biome.json ruff.toml clippy.toml
   '';
 
   dprint_json = "${gateConfigs}/dprint.json";
   treefmt_toml = "${gateConfigs}/treefmt.toml";
   biome_json = "${gateConfigs}/biome.json";
   ruff_toml = "${gateConfigs}/ruff.toml";
+  clippy_toml = "${gateConfigs}/clippy.toml";
 
   # dprint plugins, as an ordered list of {name, pkg}.
   # dprint picks the first plugin based on extension.
@@ -121,6 +126,8 @@ let
       + "${biome_json}"
       + "|"
       + "${ruff_toml}"
+      + "|"
+      + "${clippy_toml}"
     )
   );
 
@@ -353,6 +360,25 @@ let
     };
   };
 
+  # `cargo clippy` invocations for lint. Each [[run]] is one invocation and
+  # `args` follow `cargo clippy`. The default lints every target and feature;
+  # a workspace whose features are mutually exclusive (for example per-platform
+  # dioxus features) lists the feature sets it really builds instead.
+  # $GATE_CLIPPY_ARGS, when set, replaces the file with a single run.
+  clippy_toml_src = {
+    run = [
+      {
+        args = [
+          "--all-targets"
+          "--all-features"
+          "--"
+          "-D"
+          "warnings"
+        ];
+      }
+    ];
+  };
+
   biome_json_src = {
     "$schema" = "https://biomejs.dev/schemas/2.4.15/schema.json";
     plugins = [ ];
@@ -400,14 +426,23 @@ let
     # invocations reuse it instead of regenerating.
     #
     # Config resolution (check | fmt | lint | pipe):
-    #   The effective dprint.json, treefmt.toml, biome.json and ruff.toml are each
-    #   resolved independently, in this order:
+    #   The effective dprint.json, treefmt.toml, biome.json, ruff.toml and
+    #   clippy.toml are each resolved independently, in this order:
     #    1. -d/--dir DIR         (must exist, else error)
     #    2. $GATE_CONFIG         (must exist, else error)
     #    3. nearest ./.gate walking up from $PWD
     #    4. $XDG_CONFIG_HOME/gate
     #    5. the built-in defaults baked into this gate
     # A file absent from the chosen dir falls back to the built-in default.
+    #
+    # clippy (check | lint):
+    #   clippy.toml lists the `cargo clippy` invocations; each [[run]] has an
+    #   `args` array of the arguments after `cargo clippy`:
+    #     [[run]]
+    #     args = ["--workspace", "--all-targets", "--", "-D", "warnings"]
+    #   $GATE_CLIPPY_ARGS (whitespace-separated, no quoting) replaces clippy.toml
+    #   with one run. The built-in default is
+    #   `--all-targets --all-features -- -D warnings`.
     #
     # Status (fmt | check | lint):
     #   Each run ends with exactly one status line on stderr, and it is the only
@@ -428,6 +463,7 @@ let
     BUILTIN_TREEFMT="${treefmt_toml}"
     BUILTIN_BIOME="${biome_json}"
     BUILTIN_RUFF="${ruff_toml}"
+    BUILTIN_CLIPPY="${clippy_toml}"
     TREEFMT_BIN="${pkgs.treefmt}/bin/treefmt"
     CFG_VERSION="${cfgVersion}"
 
@@ -531,6 +567,7 @@ let
     # in treefmt.toml). Idempotent: a warm cache is reused with no work. Sets
     # EFFECTIVE_TREEFMT, EFFECTIVE_DPRINT, EFFECTIVE_BIOME.
     EFFECTIVE_TREEFMT=""; EFFECTIVE_DPRINT=""; EFFECTIVE_BIOME=""; EFFECTIVE_RUFF=""
+    EFFECTIVE_CLIPPY=""
     compile_config() {
       local cfgdir dprint biome ruff treefmt keyinput key root cachedir tmp leftover f
       cfgdir="$(resolve_cfg_dir)" || exit 2
@@ -538,6 +575,8 @@ let
       biome="$(resolve_file   "$cfgdir" biome.json   "$BUILTIN_BIOME")"
       ruff="$(resolve_file    "$cfgdir" ruff.toml    "$BUILTIN_RUFF")"
       treefmt="$(resolve_file "$cfgdir" treefmt.toml "$BUILTIN_TREEFMT")"
+      # Like ruff.toml, clippy.toml is read as-is and never compiled.
+      EFFECTIVE_CLIPPY="$(resolve_file "$cfgdir" clippy.toml "$BUILTIN_CLIPPY")"
 
       # Key on the gate config version and the resolved sources; for non-store
       # (repo/user) sources add the mtime so edits invalidate the cache. Use
@@ -623,6 +662,7 @@ let
       gen_one "$BUILTIN_TREEFMT" "$outdir/treefmt.toml" || rc=1
       gen_one "$BUILTIN_BIOME"   "$outdir/biome.json"   || rc=1
       gen_one "$BUILTIN_RUFF"    "$outdir/ruff.toml"    || rc=1
+      gen_one "$BUILTIN_CLIPPY"  "$outdir/clippy.toml"  || rc=1
       [ "$rc" = 0 ] && note "generated portable gate config in $outdir (no store paths; refresh-free)"
       return "$rc"
     }
@@ -756,6 +796,35 @@ let
       fi
     }
 
+    # Run every configured `cargo clippy` invocation (see "clippy" in the help).
+    # Each run's args are read as a NUL-separated list, so arguments containing
+    # spaces survive. A malformed clippy.toml fails the step rather than
+    # silently falling back to the default.
+    clippy_runs() {
+      local -a args
+      local n i json rc=0
+      if [ -n "''${GATE_CLIPPY_ARGS:-}" ]; then
+        read -r -a args <<< "$GATE_CLIPPY_ARGS"
+        note "cargo clippy ''${args[*]} (GATE_CLIPPY_ARGS)"
+        cargo clippy "''${args[@]}" || { fail clippy; return 1; }
+        return 0
+      fi
+      json="$("${yq_bin}" -p toml -o json '.' "$EFFECTIVE_CLIPPY")" \
+        || { warn "cannot parse $EFFECTIVE_CLIPPY"; fail clippy; return 1; }
+      n="$(printf '%s' "$json" | "${jq_bin}" -e '
+        if (.run | type) == "array" and (.run | length) > 0
+           and all(.run[]; (.args | type) == "array" and all(.args[]; type == "string"))
+        then .run | length else error("bad clippy.toml") end')" \
+        || { warn "invalid $EFFECTIVE_CLIPPY: expected [[run]] tables with args = [strings]"; fail clippy; return 1; }
+      for ((i = 0; i < n; i++)); do
+        mapfile -d "" -t args < <(printf '%s' "$json" | "${jq_bin}" -j --argjson i "$i" '.run[$i].args[] | ., "\u0000"')
+        note "cargo clippy ''${args[*]}"
+        cargo clippy "''${args[@]}" || rc=1
+      done
+      [ "$rc" -eq 0 ] || fail clippy
+      return "$rc"
+    }
+
     lint() {   # [paths...]
       local rc=0 f
       local -a cand sh_files py_files xml_files rs_files
@@ -801,8 +870,7 @@ let
 
       if [ "''${#rs_files[@]}" -gt 0 ] || { [ "$#" -eq 0 ] && [ -f Cargo.toml ]; }; then
         if have cargo; then
-          note "cargo clippy"
-          cargo clippy --all-targets --all-features -- -D warnings || { rc=1; fail clippy; }
+          clippy_runs || rc=1
         else
           note "clippy skipped (no cargo on PATH)"
         fi
