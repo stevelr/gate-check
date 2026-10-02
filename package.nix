@@ -1,5 +1,24 @@
 # gate-check.nix package builder for gate: ci formatter and linter
-{ pkgs, version, ... }:
+#
+# Each tool gate runs is an argument, so a consumer can swap one with
+# `.override` (the flake wraps this file in lib.makeOverridable), e.g.
+#   gate-check.override { rustfmt = rust-bin.stable.latest.rustfmt; }
+{
+  pkgs,
+  version,
+  biome ? pkgs.biome,
+  dprint ? pkgs.dprint,
+  just ? pkgs.just,
+  libxml2 ? pkgs.libxml2, # xmllint
+  nixfmt ? pkgs.nixfmt,
+  ruff ? pkgs.ruff,
+  # null (default): not bundled; rustfmt comes from the caller's PATH. See gatePath.
+  rustfmt ? null,
+  shellcheck ? pkgs.shellcheck,
+  treefmt ? pkgs.treefmt,
+  typos ? pkgs.typos,
+  ...
+}:
 
 let
   package_name = "gate-check";
@@ -135,24 +154,30 @@ let
   # so the bare command names in treefmt.toml resolve to gate's pinned versions
   # regardless of the caller's PATH. Includes the coreutils/fd plumbing the
   # script's bare calls need.
-  gatePath = pkgs.lib.makeBinPath [
-    pkgs.biome
-    pkgs.coreutils
-    pkgs.diffutils
-    pkgs.dprint
-    pkgs.fd
-    pkgs.findutils
-    pkgs.gnugrep
-    pkgs.gnused
-    pkgs.just
-    pkgs.libxml2
-    pkgs.nixfmt
-    pkgs.ruff
-    pkgs.rustfmt
-    pkgs.shellcheck
-    pkgs.treefmt
-    pkgs.typos
-  ];
+  gatePath = pkgs.lib.makeBinPath (
+    [
+      biome
+      pkgs.coreutils
+      pkgs.diffutils
+      dprint
+      pkgs.fd
+      pkgs.findutils
+      pkgs.gnugrep
+      pkgs.gnused
+      just
+      libxml2
+      nixfmt
+      ruff
+      shellcheck
+      treefmt
+      typos
+    ]
+    # rustfmt is not bundled by default: it links librustc_driver, dragging
+    # rustc + llvm (~1.7 GB) into the closure. Unless overridden, it comes from
+    # the caller's Rust toolchain, the same way `cargo clippy` does, so it also
+    # matches the project's toolchain.
+    ++ pkgs.lib.optional (rustfmt != null) rustfmt
+  );
 
   # dprint settings (formerly nix/dprint.nix, inlined). .json/.jsonc/.json5 are
   # handled by the biome plugin (it precedes the others), matching helix.nix.
@@ -273,6 +298,12 @@ let
         # use only explicit config. Without this setting,
         # any found dprint.json would override --config.
         "--config-discovery=ignore-descendants"
+        # gate picks the file set itself (fd, see candidates()) and passes it
+        # explicitly. dprint's own .gitignore filtering must stay off: with the
+        # config outside the repo, dprint scans .gitignore files from / down,
+        # so a parent .gitignore (e.g. ~/.gitignore listing `project`) silently
+        # drops every file in fmt, while check's /tmp mirror is unaffected.
+        "--no-gitignore"
       ];
       includes = [
         "*.json"
@@ -683,7 +714,8 @@ let
           fmt=(dprint fmt --config "$EFFECTIVE_DPRINT" --config-discovery=ignore-descendants --stdin "$base") ;;
         *.css|*.graphql|*.gql|*.js|*.mjs|*.cjs|*.jsx|*.ts|*.mts|*.cts|*.tsx|*.vue)
           fmt=(biome format "--config-path=$EFFECTIVE_BIOME" "--stdin-file-path=$base") ;;
-        *.rs)       fmt=(rustfmt --edition 2024) ;;
+        *.rs)       have rustfmt || warn "rustfmt not on PATH; buffer not formatted"
+                    fmt=(rustfmt --edition 2024) ;;
         *.nix)      fmt=(nixfmt) ;;
         *.py|*.pyi) fmt=(ruff format --config "$EFFECTIVE_RUFF" --stdin-filename "$base" -) ;;
       esac
@@ -727,7 +759,17 @@ let
       local work list
       work="$(mk_tmpd)"; list="$work/files"
       candidates "$@" > "$list"
+      warn_no_rustfmt "$list"
       treefmt_run "$list" "$PWD"
+    }
+
+    # rustfmt is not bundled by default (see gatePath); treefmt runs with
+    # --allow-missing-formatter, so without this note .rs files would be
+    # skipped silently.
+    warn_no_rustfmt() {   # <listfile>
+      if ! have rustfmt && grep -q '\.rs$' "$1"; then
+        warn "rustfmt not on PATH; .rs files not formatted"
+      fi
     }
 
     # ---- read-only formatting check --------------------------------------------
@@ -742,6 +784,7 @@ let
       work="$(mk_tmpd)"; list="$work/files"
       candidates "$@" > "$list"
       [ -s "$list" ] || return 0
+      warn_no_rustfmt "$list"
       mirror="$(mk_tmpd)"
       while IFS= read -r f; do
         case $f in */*) mkdir -p "$mirror/''${f%/*}" ;; esac
@@ -921,21 +964,13 @@ let
   '';
 
   gateScript = pkgs.writeShellScriptBin "gate" gate_script_src;
-
-  toolPackages = [
-    pkgs.biome
-    pkgs.dprint
-    pkgs.libxml2 # xmllint
-    pkgs.nixfmt
-    pkgs.shellcheck
-    pkgs.treefmt
-    pkgs.typos
-  ];
 in
+# Only bin/gate is exported. The tools gate runs are reached through gatePath,
+# which gate prepends to its own PATH, so they are not added to the user's PATH.
 pkgs.symlinkJoin {
   pname = package_name;
   inherit version;
-  paths = [ gateScript ] ++ toolPackages;
+  paths = [ gateScript ];
   meta = {
     description = "ci formatter and linter";
     license = [ pkgs.lib.licenses.mit ];

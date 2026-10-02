@@ -9,9 +9,9 @@
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
       system:
       let
-        version = "0.2.9";
+        version = "0.3.0";
         pkgs = nixpkgs.legacyPackages.${system};
-        gate-check = import ./package.nix { inherit pkgs version; };
+        gate-check = pkgs.lib.makeOverridable (import ./package.nix) { inherit pkgs version; };
       in
       {
         packages.default = gate-check;
