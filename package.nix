@@ -11,6 +11,7 @@
   just ? pkgs.just,
   libxml2 ? pkgs.libxml2, # xmllint
   nixfmt ? pkgs.nixfmt,
+  python3 ? pkgs.python3, # portability check
   ruff ? pkgs.ruff,
   # null (default): not bundled; rustfmt comes from the caller's PATH. See gatePath.
   rustfmt ? null,
@@ -475,6 +476,38 @@ let
     #   with one run. The built-in default is
     #   `--all-targets --all-features -- -D warnings`.
     #
+    # portability (check | lint):
+    #   Flags source files that name machine-local paths: an absolute path below
+    #   /tmp, /home, /Users, /mnt or /var/tmp, or a ~/, $HOME/ or ''${HOME}/ path.
+    #   Helps catch portability problems (tied to specific environment), and references
+    #   to files that might not be committed to the repo.
+    #   The check is textual only. Exceptions, extra roots and extra sources are configured
+    #   in the repo's .gate/portability.toml:
+    #     # add path roots to be flagged
+    #     [roots]
+    #     add = ["/media"]
+    #     # add source files to be checked (override .gitignore)
+    #     [sources]
+    #     add = ["templates/*.tmpl"]
+    #     # paths that should not be flagged
+    #     [[allowedPaths]]
+    #     path = "~/.secrets/**"
+    #     reason = "secrets never live in the repo"
+    #     # allowed src/path combinations
+    #     [[allowed]]
+    #     src = "test/stress/*.py"
+    #     path = "/mnt/scratch/**"
+    #     reason = "stress tests use the scratch volume"
+    #     optional = true           # no error when it matches nothing
+    # 
+    #   Every allowed or allowedPaths entry needs a reason. In a whole-repo run,
+    #   an entry that fails a match generates an error (to prevent stale rules
+    #   from accumulating). Set `optional=true` to all a rule with no matches.
+    # 
+    #   If a (suspected) portability error is found, and no .gate/porability.toml
+    #   exists, a draft .gate/portability.toml.TO_REVIEW is created.
+    #   Review, edit, and rename to .gate/portability.toml.
+    # 
     # Status (fmt | check | lint):
     #   Each run ends with exactly one status line on stderr, and it is the only
     #   verdict worth reading:
@@ -839,6 +872,31 @@ let
       fi
     }
 
+    # ---- portability -----------------------------------------------------------
+    # The repo root: the nearest directory holding .gate, .git or .jj.
+    repo_root() {
+      local d="$PWD"
+      while :; do
+        if [ -d "$d/.gate" ] || [ -e "$d/.git" ] || [ -d "$d/.jj" ]; then
+          printf '%s\n' "$d"; return
+        fi
+        [ "$d" = "/" ] && break
+        d="$(dirname "$d")"
+      done
+      printf '%s\n' "$PWD"
+    }
+
+    # Stale allow entries are reported only when the whole repo was scanned.
+    portability() {   # <listfile> [paths...]
+      local list="$1" root; shift
+      local -a partial=()
+      root="$(repo_root)"
+      if [ "$#" -gt 0 ] || [ "$PWD" != "$root" ]; then partial=(--partial); fi
+      note "portability"
+      "${python3}/bin/python3" -I ${./portability.py} \
+        --root "$root" --files "$list" "''${partial[@]}" || { fail portability; return 1; }
+    }
+
     # Run every configured `cargo clippy` invocation (see "clippy" in the help).
     # Each run's args are read as a NUL-separated list, so arguments containing
     # spaces survive. A malformed clippy.toml fails the step rather than
@@ -869,24 +927,29 @@ let
     }
 
     lint() {   # [paths...]
-      local rc=0 f
+      local rc=0 f sb port_list
       local -a cand sh_files py_files xml_files rs_files
       mapfile -t cand < <(candidates "$@")
       sh_files=(); py_files=(); xml_files=(); rs_files=()
+      port_list="$(mk_tmpd)/portability"
+      : > "$port_list"
 
       for f in "''${cand[@]}"; do
+        sb=""
+        [[ ''${f##*/} != *.* ]] && sb="$(shebang_class "$f")"
+        # portability.py picks the files it scans; it needs the shebang class
+        # only for extensionless scripts.
+        printf '%s\t%s\n' "$sb" "$f" >> "$port_list"
         case $f in
           *.sh|*.bash)  sh_files+=("$f");  continue ;;
           *.py|*.pyi)   py_files+=("$f");  continue ;;
           *.xml|*.svg)  xml_files+=("$f"); continue ;;
           *.rs)         rs_files+=("$f");  continue ;;
         esac
-        if [[ ''${f##*/} != *.* ]]; then
-          case $(shebang_class "$f") in
-            sh) sh_files+=("$f") ;;
-            py) py_files+=("$f") ;;
-          esac
-        fi
+        case $sb in
+          sh) sh_files+=("$f") ;;
+          py) py_files+=("$f") ;;
+        esac
       done
 
       if [ "''${#sh_files[@]}" -gt 0 ]; then
@@ -910,6 +973,8 @@ let
       note "typos"
       if [ "$#" -gt 0 ]; then ${typos_bin} "$@" || { rc=1; fail typos; }
       else ${typos_bin} || { rc=1; fail typos; }; fi
+
+      portability "$port_list" "$@" || rc=1
 
       if [ "''${#rs_files[@]}" -gt 0 ] || { [ "$#" -eq 0 ] && [ -f Cargo.toml ]; }; then
         if have cargo; then

@@ -1,0 +1,11 @@
+# The portability checker and its tests quote example machine-local paths.
+
+[[allowed]]
+src = "portability.py"
+path = "**"
+reason = "Docstring and help text show example paths; the checker reads none of them."
+
+[[allowed]]
+src = "test_portability.py"
+path = "**"
+reason = "Test inputs: strings the checker scans, never opened."

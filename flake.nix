@@ -9,7 +9,7 @@
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
       system:
       let
-        version = "0.3.1";
+        version = "0.4.0";
         pkgs = nixpkgs.legacyPackages.${system};
         gate-check = pkgs.lib.makeOverridable (import ./package.nix) { inherit pkgs version; };
       in
