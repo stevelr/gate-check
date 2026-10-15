@@ -33,9 +33,9 @@ let
   raw_ruff_toml = tomlFormat.generate "ruff.toml" ruff_toml_src;
   raw_clippy_toml = tomlFormat.generate "clippy.toml" clippy_toml_src;
 
-  shellcheck_bin = "${pkgs.shellcheck}/bin/shellcheck";
-  typos_bin = "${pkgs.typos}/bin/typos";
-  ruff_bin = "${pkgs.ruff}/bin/ruff";
+  shellcheck_bin = "${shellcheck}/bin/shellcheck";
+  typos_bin = "${typos}/bin/typos";
+  ruff_bin = "${ruff}/bin/ruff";
   sed_bin = "${pkgs.gnused}/bin/sed";
   yq_bin = "${pkgs.yq-go}/bin/yq";
   jq_bin = "${pkgs.jq}/bin/jq";
@@ -55,7 +55,7 @@ let
   # --config-discovery=false is required: the directory being
   # formatted contains a file named dprint.json, which dprint would otherwise
   # discover and prefer over --config.
-  gateConfigs = pkgs.runCommand "gate-configs" { nativeBuildInputs = [ pkgs.dprint ]; } ''
+  gateConfigs = pkgs.runCommand "gate-configs" { nativeBuildInputs = [ dprint ]; } ''
     mkdir -p $out
     cp ${raw_dprint_json}  $out/dprint.json
     cp ${raw_treefmt_toml} $out/treefmt.toml
@@ -495,7 +495,7 @@ let
     BUILTIN_BIOME="${biome_json}"
     BUILTIN_RUFF="${ruff_toml}"
     BUILTIN_CLIPPY="${clippy_toml}"
-    TREEFMT_BIN="${pkgs.treefmt}/bin/treefmt"
+    TREEFMT_BIN="${treefmt}/bin/treefmt"
     CFG_VERSION="${cfgVersion}"
 
     # ---- status reporting ------------------------------------------------------
@@ -904,7 +904,7 @@ let
 
       if [ "''${#xml_files[@]}" -gt 0 ] && have xmllint; then
         note "xmllint (''${#xml_files[@]})"
-        "${pkgs.libxml2}/bin/xmllint" --noout "''${xml_files[@]}" || { rc=1; fail xmllint; }
+        "${libxml2}/bin/xmllint" --noout "''${xml_files[@]}" || { rc=1; fail xmllint; }
       fi
 
       note "typos"
