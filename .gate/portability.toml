@@ -9,3 +9,8 @@ reason = "Docstring and help text show example paths; the checker reads none of 
 src = "test_portability.py"
 path = "**"
 reason = "Test inputs: strings the checker scans, never opened."
+
+[[allowed]]
+src = "gate.py"
+path = "**"
+reason = "The help text quotes portability.toml examples; gate reads none of those paths."

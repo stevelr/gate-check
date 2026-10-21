@@ -15,7 +15,6 @@ let
 in
 {
   programs.helix.extraPackages = with pkgs; [
-    biome
     bash-language-server
     docker-compose-language-service
     gopls
@@ -34,9 +33,16 @@ in
   programs.helix.languages = {
     language-server = {
       bash-language-server.command = "${pkgs.bash-language-server}/bin/bash-language-server";
+      # gate's own biome (same version as `gate check`), reading the repo's
+      # gate config: biome looks for biome.json at the project root, and gate
+      # keeps it in .gate/. `gate gen` writes .gate/biome.json.
       biome = {
-        command = "${pkgs.biome}/bin/biome";
-        args = [ "lsp-proxy" ];
+        command = "sh";
+        args = [
+          "-c"
+          "exec \"$(gate which biome)\" lsp-proxy"
+        ];
+        config.biome.configurationPath = ".gate/biome.json";
       };
       docker-compose-language-service.command = "${pkgs.docker-compose-language-service}/bin/docker-compose-langserver";
       ruff-server = {
@@ -181,7 +187,7 @@ in
       {
         name = "rust";
         language-servers = [
-          "rust-analyzer-clippy"
+          "rust-analyzer"
           "typos"
         ];
         formatter = gateFormat;

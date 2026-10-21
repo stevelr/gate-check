@@ -56,10 +56,9 @@ import argparse
 import os
 import re
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import tomllib
 
 DEFAULT_ROOTS = ("/tmp", "/home", "/Users", "/mnt", "/var/tmp")
 CONFIG_NAME = "portability.toml"
