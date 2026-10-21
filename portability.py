@@ -39,6 +39,8 @@ the path as written, or its home-normalised form: /home/<user>/x,
 /Users/<user>/x, $HOME/x and ${HOME}/x all become ~/x. `dir/**` also matches
 `dir` itself.
 
+Built in: .beads/*.jsonl (issue tracker exports) may cite any path.
+
 Every entry needs a reason; a reason starting with TODO is rejected. In a
 whole-repo run an entry that matches nothing is an error unless optional.
 
@@ -167,7 +169,7 @@ def normalise_home(path: str) -> str:
 
 @dataclass
 class Rule:
-    kind: str  # "allowedPaths" or "allowed"
+    kind: str  # "allowedPaths", "allowed" or "built-in"
     index: int
     path: str
     reason: str
@@ -189,6 +191,20 @@ class Rule:
         if self.src_re is not None and not self.src_re.match(src):
             return False
         return bool(self.path_re.match(path) or self.path_re.match(normalised))
+
+
+# Built-in [[allowed]] entries, applied in every repo. Optional, so a repo that
+# does not use the tool never sees them reported as stale.
+BUILTIN_ALLOWED = (
+    (".beads/*.jsonl", "**", "beads issue exports: tracker prose that cites paths"),
+)
+
+
+def builtin_rules() -> list[Rule]:
+    return [
+        Rule("built-in", i, path, reason, src, optional=True)
+        for i, (src, path, reason) in enumerate(BUILTIN_ALLOWED)
+    ]
 
 
 @dataclass
@@ -216,7 +232,7 @@ def _check_keys(table: object, allowed: set[str], where: str) -> dict:
 
 def load_config(path: Path) -> Config:
     if not path.exists():
-        return Config(list(DEFAULT_ROOTS), [], [])
+        return Config(list(DEFAULT_ROOTS), [], builtin_rules())
     try:
         data = tomllib.loads(path.read_text())
     except (OSError, tomllib.TOMLDecodeError) as e:
@@ -232,7 +248,7 @@ def load_config(path: Path) -> Config:
         if root not in roots:
             roots.append(root)
 
-    rules: list[Rule] = []
+    rules = builtin_rules()
     errors: list[str] = []
     for kind, required in (("allowedPaths", {"path"}), ("allowed", {"src", "path"})):
         entries = data.get(kind, [])

@@ -159,6 +159,18 @@ class RepoTests(unittest.TestCase):
         self.assertNotIn("init.lua:1", err)
         self.assertNotIn("README.md", err)
 
+    def test_beads_exports_are_allowed_without_config(self) -> None:
+        self.write(".beads/issues.jsonl", '{"comment": "lost /home/user/tmp/x"}\n')
+        self.write(".beads/config.yaml", "db: /home/user/x.db\n")
+        rc, err = self.run_check({".beads/issues.jsonl": "", ".beads/config.yaml": ""})
+        self.assertEqual(rc, 1)
+        self.assertNotIn("issues.jsonl", err)
+        self.assertIn(".beads/config.yaml:1:", err)
+        # Never reported stale in a repo without beads.
+        self.write(".gate/portability.toml", "")
+        self.write("a.py", "x = 1\n")
+        self.assertEqual(self.run_check({"a.py": ""})[0], 0)
+
     def test_findings_without_config_write_a_proposal(self) -> None:
         self.write("a.py", 'x = "/home/alice/tmp/x.json"\n')
         rc, err = self.run_check({"a.py": "py"})

@@ -500,6 +500,7 @@ let
     #     reason = "stress tests use the scratch volume"
     #     optional = true           # no error when it matches nothing
     # 
+    #   Built in: .beads/*.jsonl (issue tracker exports) may cite any path.
     #   Every allowed or allowedPaths entry needs a reason. In a whole-repo run,
     #   an entry that fails a match generates an error (to prevent stale rules
     #   from accumulating). Set `optional=true` to all a rule with no matches.
