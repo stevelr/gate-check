@@ -10,6 +10,8 @@
   gate pipe   [-d DIR] <name>       stdin -> stdout; <name> picks formatter
   gate gen    [-f] [-d DIR]         write portable default configs to ./.gate
   gate which  TOOL... | --all       path of each tool gate runs (--all: every tool)
+  gate lsp    biome                 gate's biome as an editor language server
+                                    (stdio), using the repo's .gate/biome.json
 
 At run time (fmt | check | pipe) gate compiles the resolved config into an
 "effective" config under a per-(config,gate-version) CACHE dir, so repeated
@@ -24,6 +26,16 @@ Config resolution (check | fmt | lint | pipe):
    4. $XDG_CONFIG_HOME/gate
    5. the built-in defaults baked into this gate
 A file absent from the chosen dir falls back to the built-in default.
+
+lsp biome:
+  Runs `biome lsp-proxy` (the biome `gate which biome` names) for an editor,
+  in the workspace root. When the resolved biome.json is inside the workspace
+  (normally .gate/biome.json), gate relays the LSP stream and sets biome's
+  `configurationPath` setting to it. Otherwise biome runs unchanged and uses
+  the repo's own biome.json or its defaults: biome lints nothing when its
+  configuration is outside the workspace, so ~/.config/gate and the built-in
+  biome.json are not applied (the built-in lint rules are biome's defaults).
+  The editor should not set biome.configurationPath itself.
 
 clippy (check | lint):
   clippy.toml lists the `cargo clippy` invocations; each [[run]] has an
@@ -98,6 +110,7 @@ Formatters (fmt | check):
 from __future__ import annotations
 
 import atexit
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -107,6 +120,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 BUILD_INFO = "@gate_build_info@"
@@ -903,9 +917,17 @@ class Gate:
                 rc = 1
                 self.fail("xmllint")
 
-        if linters:
+        if linters and files:
+            # typos gets gate's file list, so it skips what every other step skips
+            # (.gitignore even without a .git dir, .fdignore). --force-exclude keeps
+            # the repo's typos config excludes in force for these explicit paths.
+            typos_list = os.path.join(self.mk_tmpd(), "typos")
+            Path(typos_list).write_text("".join(f"{f}\n" for f in files), encoding="utf-8")
             self.note("typos")
-            if self.run([self.build["typos"], *paths]) != 0:
+            if (
+                self.run([self.build["typos"], "--force-exclude", "--file-list", typos_list])
+                != 0
+            ):
                 rc = 1
                 self.fail("typos")
 
@@ -956,6 +978,43 @@ class Gate:
                 rc = 1
         return rc
 
+    # ---- lsp ---------------------------------------------------------------
+    # biome's lsp-proxy has no --config-path: it reads biome.configurationPath
+    # from the editor's LSP settings, and a path naming a missing file stops it
+    # from processing anything. A static editor setting can't follow each repo,
+    # so gate supplies the setting itself, only where the repo has a config.
+
+    def lsp_biome_config(self) -> str | None:
+        """The resolved biome.json when it is inside the workspace (cwd); None
+        otherwise. biome lints nothing with a config outside the workspace."""
+        cfgdir = self.resolve_cfg_dir()
+        if not cfgdir:
+            return None
+        path = os.path.realpath(self.path_of(os.path.join(cfgdir, "biome.json")))
+        root = os.path.realpath(self.cwd)
+        if not os.path.isfile(path) or os.path.commonpath([root, path]) != root:
+            return None
+        return path
+
+    def lsp(self, args: list[str]) -> int:
+        if args != ["biome"]:
+            self.die("lsp: expected `gate lsp biome`")
+        biome = self.tool_paths()["biome"]
+        if not biome:
+            self.die("lsp: biome not found")
+        argv = [biome, "lsp-proxy"]
+        cfg = self.lsp_biome_config()
+        if cfg is None:
+            sys.stdout.flush()
+            os.execve(biome, argv, self.env)
+        rc = lsp_relay(argv, self.env, self.cwd, cfg)
+        # The stdin thread may still be blocked in a read of the buffered
+        # sys.stdin, which aborts a normal interpreter shutdown.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        self.cleanup()
+        os._exit(rc)
+
     # ---- dispatch ----------------------------------------------------------
 
     def main(self, argv: list[str]) -> int:
@@ -994,15 +1053,135 @@ class Gate:
             return self.gen()
         elif cmd == "which":
             return self.which(args)
+        elif cmd == "lsp":
+            return self.lsp(args)
         elif cmd in ("version", "-V", "--version"):
             print(f"{self.build['package']}-v{self.build['version']}")
         elif cmd in ("help", "-h", "--help", ""):
             print(__doc__.rstrip("\n"))
         else:
             self.die(
-                f"unknown command '{cmd}' (expected: fmt | check | lint | pipe | gen | which | version)"
+                f"unknown command '{cmd}' (expected: fmt | check | lint | pipe | gen | which | lsp | version)"
             )
         return 0
+
+
+def lsp_read(stream) -> bytes | None:
+    """The body of the next LSP message on ``stream``; None at end of stream."""
+    length = None
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            if length is not None:
+                break
+            continue
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value)
+    body = stream.read(length)
+    return body if len(body) == length else None
+
+
+def lsp_write(stream, body: bytes) -> None:
+    stream.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    stream.flush()
+
+
+def _with_cfg(value, cfg: str) -> dict:
+    """``value`` (a biome settings object or null) with configurationPath ``cfg``."""
+    out = dict(value) if isinstance(value, dict) else {}
+    out["configurationPath"] = cfg
+    return out
+
+
+def lsp_inject(msg: dict, cfg: str, pending: dict) -> bool:
+    """Set biome.configurationPath to ``cfg`` in a client->server message: the
+    settings of workspace/didChangeConfiguration, and the editor's answer to a
+    workspace/configuration request (``pending``: request id -> item sections).
+    True when ``msg`` changed."""
+    if msg.get("method") == "workspace/didChangeConfiguration":
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        settings = params.get("settings") if isinstance(params.get("settings"), dict) else {}
+        params["settings"] = {**settings, "biome": _with_cfg(settings.get("biome"), cfg)}
+        msg["params"] = params
+        return True
+    if "method" in msg or "id" not in msg:
+        return False
+    sections = pending.pop(msg["id"], None)
+    if sections is None or "result" not in msg:
+        return False
+    result = msg["result"] if isinstance(msg["result"], list) else []
+    result = result + [None] * (len(sections) - len(result))
+    for i, section in enumerate(sections):
+        if section == "biome":
+            result[i] = _with_cfg(result[i], cfg)
+        elif not section:  # the whole settings object
+            whole = result[i] if isinstance(result[i], dict) else {}
+            result[i] = {**whole, "biome": _with_cfg(whole.get("biome"), cfg)}
+    msg["result"] = result
+    return True
+
+
+def lsp_relay(argv: list[str], env: dict, cwd: str, cfg: str) -> int:
+    """Run the language server ``argv``, relaying stdio, with biome's
+    configurationPath set to ``cfg`` (see lsp_inject). Returns its exit code."""
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, cwd=cwd
+    )
+    pending: dict = {}  # workspace/configuration requests awaiting the editor
+
+    def to_client() -> None:
+        out = sys.stdout.buffer
+        try:
+            while (body := lsp_read(proc.stdout)) is not None:
+                if b"workspace/configuration" in body:
+                    try:
+                        msg = json.loads(body)
+                    except ValueError:
+                        msg = None
+                    if (
+                        isinstance(msg, dict)
+                        and msg.get("method") == "workspace/configuration"
+                        and "id" in msg
+                    ):
+                        items = (msg.get("params") or {}).get("items") or []
+                        pending[msg["id"]] = [
+                            it.get("section") if isinstance(it, dict) else None for it in items
+                        ]
+                lsp_write(out, body)
+        except (BrokenPipeError, OSError):
+            pass
+
+    def to_server() -> None:
+        src = sys.stdin.buffer
+        try:
+            while (body := lsp_read(src)) is not None:
+                # Parse only what lsp_inject may change (not every didChange).
+                if b"didChangeConfiguration" in body or (pending and b'"result"' in body):
+                    try:
+                        msg = json.loads(body)
+                    except ValueError:
+                        msg = None
+                    if isinstance(msg, dict) and lsp_inject(msg, cfg, pending):
+                        body = json.dumps(msg).encode()
+                lsp_write(proc.stdin, body)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+
+    reader = threading.Thread(target=to_client, daemon=True)
+    reader.start()
+    # stdin may stay open after the server exits, so it gets a daemon thread
+    # and the relay ends with the server.
+    threading.Thread(target=to_server, daemon=True).start()
+    rc = proc.wait()
+    reader.join(timeout=5)
+    return rc
 
 
 def batches(items: list[str], budget: int) -> list[list[str]]:

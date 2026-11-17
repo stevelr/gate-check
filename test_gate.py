@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -290,7 +293,9 @@ class Lint(Base):
         self.assertEqual(by_tool["ruff"][:5], ["ruff", "check", "-q", "--config", "R"])
         self.assertEqual(sorted(by_tool["ruff"][5:]), ["b.py", "tool"])
         self.assertEqual(by_tool["xmllint"][1:], ["--noout", "c.svg"])
-        self.assertEqual(by_tool["typos"], ["typos"])
+        self.assertEqual(by_tool["typos"][:3], ["typos", "--force-exclude", "--file-list"])
+        typos_files = Path(by_tool["typos"][3]).read_text().splitlines()
+        self.assertEqual(sorted(typos_files), sorted(g.candidates([])))
         self.assertEqual(by_tool["cargo"], ["cargo", "clippy", "--all-targets"])
         port = by_tool["python3"]
         self.assertNotIn("--partial", port)
@@ -519,6 +524,105 @@ class Which(Base):
         self.assertEqual(rows["biome"], str(self.bin / "biome"))
         self.assertEqual(rows["typos"], "/store/typos/bin/typos")
         self.assertEqual(self.exit_code(self.gate().main, ["which"]), 2)
+
+
+class Lsp(Base):
+    def test_config_only_inside_workspace(self) -> None:
+        self.assertIsNone(self.gate().lsp_biome_config())
+        (self.repo / ".gate").mkdir()
+        self.assertIsNone(self.gate().lsp_biome_config())  # .gate without biome.json
+        # a user config is outside the workspace: biome would lint nothing with it
+        write(self.tmp / "xdg" / "gate" / "biome.json", "{}\n")
+        self.assertIsNone(self.gate(XDG_CONFIG_HOME=str(self.tmp / "xdg")).lsp_biome_config())
+        cfg = write(self.repo / ".gate" / "biome.json", "{}\n")
+        self.assertEqual(self.gate().lsp_biome_config(), os.path.realpath(cfg))
+
+    def test_inject(self) -> None:
+        msg = {"method": "workspace/didChangeConfiguration", "params": {"settings": None}}
+        self.assertTrue(gate.lsp_inject(msg, "/r/c.json", {}))
+        self.assertEqual(
+            msg["params"]["settings"], {"biome": {"configurationPath": "/r/c.json"}}
+        )
+        msg = {
+            "method": "workspace/didChangeConfiguration",
+            "params": {"settings": {"x": 1, "biome": {"configurationPath": "no", "y": 2}}},
+        }
+        gate.lsp_inject(msg, "/r/c.json", {})
+        self.assertEqual(
+            msg["params"]["settings"],
+            {"x": 1, "biome": {"configurationPath": "/r/c.json", "y": 2}},
+        )
+        pending = {3: ["biome", None, "other"]}
+        msg = {"id": 3, "result": [None, {"x": 1}]}
+        self.assertTrue(gate.lsp_inject(msg, "/c", pending))
+        self.assertEqual(
+            msg["result"],
+            [
+                {"configurationPath": "/c"},
+                {"x": 1, "biome": {"configurationPath": "/c"}},
+                None,
+            ],
+        )
+        self.assertEqual(pending, {})
+        # other responses, requests and notifications pass through
+        for other in (
+            {"id": 4, "result": None},
+            {"id": 1, "method": "initialize", "params": {}},
+            {"method": "textDocument/didOpen", "params": {}},
+        ):
+            self.assertFalse(gate.lsp_inject(dict(other), "/c", {3: ["biome"]}))
+
+    def test_read_write(self) -> None:
+        buf = io.BytesIO()
+        gate.lsp_write(buf, b'{"a":1}')
+        gate.lsp_write(buf, b"{}")
+        buf.seek(0)
+        self.assertEqual(gate.lsp_read(buf), b'{"a":1}')
+        self.assertEqual(gate.lsp_read(buf), b"{}")
+        self.assertIsNone(gate.lsp_read(buf))
+
+    def test_bad_args(self) -> None:
+        self.assertEqual(self.exit_code(self.gate().main, ["lsp"]), 2)
+        self.assertEqual(self.exit_code(self.gate().main, ["lsp", "ruff"]), 2)
+
+    def test_relay_end_to_end(self) -> None:
+        """A fake biome asks for its settings and echoes the editor's answer."""
+        write(
+            self.bin / "biome",
+            "#!" + sys.executable + "\n"
+            "import sys\n"
+            f"sys.path.insert(0, {str(Path(gate.__file__).parent)!r})\n"
+            "import json, gate\n"
+            "req = {'jsonrpc': '2.0', 'id': 7, 'method': 'workspace/configuration',\n"
+            "       'params': {'items': [{'section': 'biome'}]}}\n"
+            "gate.lsp_write(sys.stdout.buffer, json.dumps(req).encode())\n"
+            "resp = json.loads(gate.lsp_read(sys.stdin.buffer))\n"
+            "note = {'jsonrpc': '2.0', 'method': 'echo', 'params': resp}\n"
+            "gate.lsp_write(sys.stdout.buffer, json.dumps(note).encode())\n",
+            0o755,
+        )
+        cfg = write(self.repo / ".gate" / "biome.json", "{}\n")
+        info = write(self.tmp / "build.json", json.dumps(self.build))
+        proc = subprocess.Popen(
+            [sys.executable, gate.__file__, "lsp", "biome"],
+            cwd=self.repo,
+            env={**self.env, "GATE_BUILD_INFO": str(info)},
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        try:
+            req = json.loads(gate.lsp_read(proc.stdout))
+            self.assertEqual(req["method"], "workspace/configuration")
+            gate.lsp_write(proc.stdin, b'{"jsonrpc": "2.0", "id": 7, "result": [null]}')
+            echo = json.loads(gate.lsp_read(proc.stdout))
+            self.assertEqual(
+                echo["params"]["result"], [{"configurationPath": os.path.realpath(cfg)}]
+            )
+            self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            proc.kill()
+            proc.stdin.close()
+            proc.stdout.close()
 
 
 class CheckParts(Base):

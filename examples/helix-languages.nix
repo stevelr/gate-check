@@ -33,16 +33,17 @@ in
   programs.helix.languages = {
     language-server = {
       bash-language-server.command = "${pkgs.bash-language-server}/bin/bash-language-server";
-      # gate's own biome (same version as `gate check`), reading the repo's
-      # gate config: biome looks for biome.json at the project root, and gate
-      # keeps it in .gate/. `gate gen` writes .gate/biome.json.
+      # gate's own biome (same version as `gate check`). gate points it at the
+      # repo's .gate/biome.json when there is one; otherwise biome uses the
+      # repo's own biome.json or its defaults. Don't set
+      # config.biome.configurationPath here: biome stops linting when that file
+      # is missing.
       biome = {
-        command = "sh";
+        command = "gate";
         args = [
-          "-c"
-          "exec \"$(gate which biome)\" lsp-proxy"
+          "lsp"
+          "biome"
         ];
-        config.biome.configurationPath = ".gate/biome.json";
       };
       docker-compose-language-service.command = "${pkgs.docker-compose-language-service}/bin/docker-compose-langserver";
       ruff-server = {
